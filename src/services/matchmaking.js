@@ -18,15 +18,56 @@ function getDistanceKm(lat1, lon1, lat2, lon2) {
 }
 
 /**
+ * Normalizes a service name or category string into a standard specialization category.
+ * @param {string} serviceOrCategory 
+ * @returns {string|null}
+ */
+export const normalizeSpecialization = (serviceOrCategory) => {
+  if (!serviceOrCategory) return null;
+  const normalized = serviceOrCategory.toLowerCase().trim();
+  
+  // Exact or direct matches
+  if (normalized === 'cleaning') return "Cleaning";
+  if (normalized === 'ac repair') return "AC Repair";
+  if (normalized === 'plumbing') return "Plumbing";
+  if (normalized === 'electrician') return "Electrician";
+  if (normalized === 'salon') return "Salon";
+
+  // Keyword matches for Electrician
+  if (normalized.includes("elect") || normalized.includes("fan") || normalized.includes("light") || normalized.includes("switch") || normalized.includes("wire")) {
+    return "Electrician";
+  }
+  // Keyword matches for Plumbing
+  if (normalized.includes("plumb") || normalized.includes("pipe") || normalized.includes("tap") || normalized.includes("fitting") || normalized.includes("leak") || normalized.includes("drain") || normalized.includes("sink")) {
+    return "Plumbing";
+  }
+  // Keyword matches for AC Repair
+  if (normalized.includes("ac") || normalized.includes("cool")) {
+    return "AC Repair";
+  }
+  // Keyword matches for Salon
+  if (normalized.includes("salon") || normalized.includes("groom") || normalized.includes("spa") || normalized.includes("hair") || normalized.includes("facial") || normalized.includes("massage")) {
+    return "Salon";
+  }
+  // Keyword matches for Cleaning (check cleaning last as fallback for house, deep, etc.)
+  if (normalized.includes("clean") || normalized.includes("wash") || normalized.includes("sofa") || normalized.includes("carpet") || normalized.includes("deep") || normalized.includes("fridge")) {
+    return "Cleaning";
+  }
+
+  return null;
+};
+
+/**
  * Finds the nearest active partners to a given location using Redis GEORADIUS.
  * Falls back to Firestore if Redis is unavailable.
  * @param {number} latitude 
  * @param {number} longitude 
  * @param {number} radiusInKm - Search radius in kilometers
  * @param {number} maxResults - Maximum number of partners to return
+ * @param {string|null} specialization - Required partner specialization
  * @returns {Promise<Array<{partnerId: string, distance: number}>>}
  */
-export const findNearestPartners = async (latitude, longitude, radiusInKm = 5, maxResults = 10) => {
+export const findNearestPartners = async (latitude, longitude, radiusInKm = 5, maxResults = 10, specialization = null) => {
   try {
     let results = [];
     
@@ -42,16 +83,59 @@ export const findNearestPartners = async (latitude, longitude, radiusInKm = 5, m
         'WITHCOORD',
         'ASC',
         'COUNT',
-        maxResults
+        specialization ? Math.max(maxResults * 5, 50) : maxResults
       );
+
+      // Filter by specialization if requested
+      if (specialization) {
+        const filteredResults = [];
+        const pipeline = redis.pipeline();
+        results.forEach(r => {
+          pipeline.hget(`partner:${r[0]}`, 'selectedServices');
+        });
+        const specializations = await pipeline.exec();
+
+        for (let i = 0; i < results.length; i++) {
+          const partnerId = results[i][0];
+          const servicesRaw = specializations[i] ? specializations[i][1] : null;
+          let services = [];
+
+          if (servicesRaw) {
+            try {
+              services = JSON.parse(servicesRaw);
+            } catch (err) {
+              logger.warn(`⚠️ Failed to parse selectedServices for partner ${partnerId}: ${err.message}`);
+            }
+          } else if (db) {
+            // Fallback: fetch from Firestore if Redis cache doesn't have it
+            try {
+              const partnerDoc = await db.collection('partners').doc(partnerId).get();
+              if (partnerDoc.exists) {
+                services = partnerDoc.data().selectedServices || [];
+                // Cache it back to Redis
+                await redis.hset(`partner:${partnerId}`, 'selectedServices', JSON.stringify(services));
+              }
+            } catch (fsErr) {
+              logger.warn(`⚠️ Firestore fallback failed for partner ${partnerId}: ${fsErr.message}`);
+            }
+          }
+
+          if (services.some(s => s.toLowerCase() === specialization.toLowerCase())) {
+            filteredResults.push(results[i]);
+          }
+        }
+        results = filteredResults.slice(0, maxResults);
+      }
     } catch (redisError) {
       logger.warn(`⚠️ Redis georadius failed, falling back to Firestore: ${redisError.message}`);
       
       // Fallback: Query all online partners from Firestore and filter locally
       if (db) {
-        const snapshot = await db.collection('partners')
-          .where('isOnline', '==', true)
-          .get();
+        let queryRef = db.collection('partners').where('isOnline', '==', true);
+        if (specialization) {
+          queryRef = queryRef.where('selectedServices', 'array-contains', specialization);
+        }
+        const snapshot = await queryRef.get();
         
         const onlinePartners = [];
         snapshot.forEach(doc => {

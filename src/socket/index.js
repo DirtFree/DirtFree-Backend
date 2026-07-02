@@ -2,7 +2,7 @@ import { Server } from 'socket.io';
 import logger from '../config/logger.js';
 import { auth, db } from '../config/firebase.js';
 import redis from '../config/redis.js';
-import { findNearestPartners } from '../services/matchmaking.js';
+import { findNearestPartners, normalizeSpecialization } from '../services/matchmaking.js';
 
 export const initSocket = (server) => {
   const io = new Server(server, {
@@ -12,6 +12,27 @@ export const initSocket = (server) => {
     },
     pingTimeout: 60000,
   });
+
+  const loadPartnerServices = async (partnerId, socket) => {
+    if (!db || !partnerId) return [];
+    try {
+      if (socket && socket.selectedServices) {
+        return socket.selectedServices;
+      }
+      const doc = await db.collection('partners').doc(partnerId).get();
+      if (doc.exists) {
+        const services = doc.data().selectedServices || [];
+        if (socket) {
+          socket.selectedServices = services;
+        }
+        await redis.hset(`partner:${partnerId}`, 'selectedServices', JSON.stringify(services));
+        return services;
+      }
+    } catch (err) {
+      logger.warn(`⚠️ Failed to load services for partner ${partnerId}: ${err.message}`);
+    }
+    return [];
+  };
 
   // Security Middleware: Socket Authentication
   io.use(async (socket, next) => {
@@ -41,11 +62,12 @@ export const initSocket = (server) => {
     logger.info(`🔌 New connection: ${socket.id} (${socket.user?.email || 'Anonymous'})`);
 
     // Dynamic Room Joining based on role
-    socket.on('register', (data) => {
+    socket.on('register', async (data) => {
       if (data.role === 'partner') {
         socket.join('partners');
         socket.partnerId = data.id; // Store partnerId on socket
         logger.info(`👷 Partner ${data.id} joined partners room`);
+        await loadPartnerServices(data.id, socket);
       }
     });
 
@@ -63,6 +85,8 @@ export const initSocket = (server) => {
         if (isOnline && latitude && longitude) {
           // syntax: GEOADD key longitude latitude member
           await redis.geoadd('partners_location', longitude, latitude, partnerId);
+          // Load services to cache on socket and Redis
+          await loadPartnerServices(partnerId, socket);
           // Also update their metadata
           await redis.hset(`partner:${partnerId}`, 'isOnline', 'true', 'lastUpdated', Date.now());
         } else if (!isOnline) {
@@ -134,18 +158,37 @@ export const initSocket = (server) => {
 
     // Customer requests a booking (Matchmaking)
     socket.on('requestBooking', async (data) => {
-      const { bookingId, latitude, longitude, radiusInKm } = data;
-      logger.info(`🔍 Customer ${socket.id} requesting booking ${bookingId} near ${latitude}, ${longitude}`);
+      const { bookingId, latitude, longitude, radiusInKm, category } = data;
+      logger.info(`🔍 Customer ${socket.id} requesting booking ${bookingId} near ${latitude}, ${longitude} (Category: ${category})`);
 
       try {
-        const nearestPartners = await findNearestPartners(latitude, longitude, radiusInKm || 5, 10);
+        let specialization = category;
+        if (!specialization && bookingId && db) {
+          try {
+            const bookingDoc = await db.collection('bookings').doc(bookingId).get();
+            if (bookingDoc.exists) {
+              const bookingData = bookingDoc.data();
+              specialization = bookingData.category || bookingData.service;
+            }
+          } catch (dbErr) {
+            logger.warn(`⚠️ Failed to fetch booking details for matchmaking: ${dbErr.message}`);
+          }
+        }
+
+        // Normalize the specialization
+        const normalizedSpec = normalizeSpecialization(specialization);
+        if (specialization && !normalizedSpec) {
+          logger.warn(`⚠️ Could not normalize specialization: "${specialization}". Proceeding without filtering.`);
+        }
+
+        const nearestPartners = await findNearestPartners(latitude, longitude, radiusInKm || 5, 10, normalizedSpec);
         
         if (nearestPartners.length === 0) {
           socket.emit('noPartnersFound', { bookingId, message: 'No partners available nearby right now.' });
           return;
         }
 
-        logger.info(`✨ Found ${nearestPartners.length} nearby partners for booking ${bookingId}`);
+        logger.info(`✨ Found ${nearestPartners.length} nearby partners for booking ${bookingId} (Specialization: ${normalizedSpec})`);
 
         // Broadcast a 'newBookingRequest' to the specific socket IDs of those partners
         // To do this reliably, we can have partners join a room with their partnerId

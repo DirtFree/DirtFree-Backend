@@ -1,5 +1,6 @@
 import { db } from '../config/firebase.js';
 import logger from '../config/logger.js';
+import { normalizeSpecialization } from './matchmaking.js';
 
 // Haversine formula — distance between two GPS points in km
 function getDistanceKm(lat1, lon1, lat2, lon2) {
@@ -39,8 +40,11 @@ export const startDispatcher = (io) => {
             const bookingLat = booking.location?.lat || booking.latitude;
             const bookingLng = booking.location?.lng || booking.longitude;
 
+            const bookingCategory = booking.category || booking.serviceName || (booking.items && booking.items[0]?.serviceName) || booking.service;
+            const bookingSpecialization = normalizeSpecialization(bookingCategory);
+
             if (bookingLat && bookingLng) {
-              logger.info(`🆕 New booking found: ${booking.id} (Urgent: ${isUrgent}). Filtering partners within 2km...`);
+              logger.info(`🆕 New booking found: ${booking.id} (Category: ${bookingSpecialization}, Urgent: ${isUrgent}). Filtering partners within 2km...`);
               
               // Get all sockets in the 'partners' room
               const partnerSockets = io.sockets.adapter.rooms.get('partners');
@@ -48,6 +52,16 @@ export const startDispatcher = (io) => {
                 for (const socketId of partnerSockets) {
                   const socket = io.sockets.sockets.get(socketId);
                   if (socket && socket.latitude && socket.longitude) {
+                    // Check if partner offers this service category (specialization)
+                    const partnerServices = socket.selectedServices || [];
+                    if (bookingSpecialization && partnerServices.length > 0) {
+                      const hasSpecialization = partnerServices.some(s => s.toLowerCase() === bookingSpecialization.toLowerCase());
+                      if (!hasSpecialization) {
+                        logger.info(`⏭️ Skipping dispatch for booking ${booking.id} to partner ${socket.partnerId} (Mismatch specialization. Booking: ${bookingSpecialization}, Partner has: ${partnerServices.join(', ')})`);
+                        continue;
+                      }
+                    }
+
                     const distance = getDistanceKm(bookingLat, bookingLng, socket.latitude, socket.longitude);
                     if (distance <= 2.0) { // 2 km operating circle limit
                       logger.info(`📌 Dispatching booking ${booking.id} to partner ${socket.partnerId} (${distance.toFixed(2)} km away)`);
@@ -80,35 +94,42 @@ export const startDispatcher = (io) => {
                 }
               }
             } else {
-              logger.info(`🆕 New booking found: ${booking.id} (Urgent: ${isUrgent}). No coords, broadcasting to all partners...`);
-              // Fallback to broadcast if booking has no coordinates
-              io.to('partners').emit('newNearbyBooking', {
-                id: booking.id,
-                serviceName: booking.serviceName || (booking.items && booking.items[0]?.serviceName) || 'Service Request',
-                location: booking.location,
-                userAddress: booking.userAddress,
-                isUrgent: isUrgent,
-                distance: "unknown",
-                timestamp: new Date()
-              });
+              logger.info(`🆕 New booking found: ${booking.id} (Category: ${bookingSpecialization}, Urgent: ${isUrgent}). No coords, dispatching to matching partners...`);
+              
+              const partnerSockets = io.sockets.adapter.rooms.get('partners');
+              if (partnerSockets) {
+                for (const socketId of partnerSockets) {
+                  const socket = io.sockets.sockets.get(socketId);
+                  if (socket) {
+                    const partnerServices = socket.selectedServices || [];
+                    if (bookingSpecialization && partnerServices.length > 0) {
+                      const hasSpecialization = partnerServices.some(s => s.toLowerCase() === bookingSpecialization.toLowerCase());
+                      if (!hasSpecialization) continue;
+                    }
 
-              // Broadcast newBookingRequest to all partners in the room as fallback
-              const partnerSocketsInRoom = io.sockets.adapter.rooms.get('partners');
-              const targetPartnerIds = partnerSocketsInRoom ? Array.from(partnerSocketsInRoom).map(sId => {
-                const s = io.sockets.sockets.get(sId);
-                return s ? s.partnerId : null;
-              }).filter(Boolean) : [];
+                    socket.emit('newNearbyBooking', {
+                      id: booking.id,
+                      serviceName: booking.serviceName || (booking.items && booking.items[0]?.serviceName) || 'Service Request',
+                      location: booking.location,
+                      userAddress: booking.userAddress,
+                      isUrgent: isUrgent,
+                      distance: "unknown",
+                      timestamp: new Date()
+                    });
 
-              io.to('partners').emit('newBookingRequest', {
-                bookingId: booking.id,
-                serviceName: booking.serviceName || (booking.items && booking.items[0]?.serviceName) || 'Service Request',
-                location: booking.location,
-                userAddress: booking.userAddress,
-                isUrgent: isUrgent,
-                targetPartnerIds: targetPartnerIds,
-                distances: [],
-                timestamp: new Date()
-              });
+                    socket.emit('newBookingRequest', {
+                      bookingId: booking.id,
+                      serviceName: booking.serviceName || (booking.items && booking.items[0]?.serviceName) || 'Service Request',
+                      location: booking.location,
+                      userAddress: booking.userAddress,
+                      isUrgent: isUrgent,
+                      targetPartnerIds: [socket.partnerId],
+                      distances: [],
+                      timestamp: new Date()
+                    });
+                  }
+                }
+              }
             }
           }
         }
